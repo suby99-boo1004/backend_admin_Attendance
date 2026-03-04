@@ -1,12 +1,11 @@
-
 from __future__ import annotations
 
 from datetime import date
 from typing import Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
 from app.core.deps import get_db, get_current_user
@@ -31,35 +30,67 @@ from .service import (
 )
 from .auto_close import preview_auto_close, run_auto_close
 from .scheduler import start_scheduler, get_status, reload_schedule
-print("### admin_attendance router LOADED ###")
+
+
 router = APIRouter(prefix="/attendance", tags=["Admin"])
 
+print("### admin_attendance router loaded from:", __file__)
 
-# 내부 직원(role_id 6/7/8)만 허용
+# 내부직원(관리자/운영자/회사직원) 허용 기준
 _ALLOWED_INTERNAL_ROLE_IDS = (6, 7, 8)
+_ALLOWED_INTERNAL_ROLE_CODES = ("ADMIN", "OPERATOR", "STAFF")
 
 
-def _is_internal(user: User) -> bool:
+def _get_role_code(db: Session, user: User) -> Optional[str]:
+    """roles 테이블에서 code 조회(없으면 None)"""
+    role_id = getattr(user, "role_id", None)
+    if not role_id:
+        return None
+    try:
+        return db.execute(text("SELECT code FROM roles WHERE id = :id"), {"id": int(role_id)}).scalar()
+    except Exception:
+        return None
+
+
+def _is_internal_db(db: Session, user: User) -> bool:
+    """내부직원 판정(강화 버전)
+
+    - role_id가 정상 세팅된 경우: 6/7/8 허용
+    - role_id가 없거나 6/7/8이 아니어도:
+        roles.code가 ADMIN/OPERATOR/STAFF면 허용
+    - JWT/모델에 role_code가 직접 들어오는 환경도 대비(있으면 사용)
+    """
+    # 1) role_id 우선
     rid = getattr(user, "role_id", None)
     try:
         rid_i = int(rid) if rid is not None else None
     except Exception:
         rid_i = None
-    return rid_i in _ALLOWED_INTERNAL_ROLE_IDS
+    if rid_i in _ALLOWED_INTERNAL_ROLE_IDS:
+        return True
+
+    # 2) user.role_code 같은 필드가 있으면 활용
+    role_code = getattr(user, "role_code", None)
+    if isinstance(role_code, str) and role_code.upper() in _ALLOWED_INTERNAL_ROLE_CODES:
+        return True
+
+    # 3) roles 테이블 조회
+    code = _get_role_code(db, user)
+    if isinstance(code, str) and code.upper() in _ALLOWED_INTERNAL_ROLE_CODES:
+        return True
+
+    return False
 
 
-def _require_internal(user: User) -> None:
-    # ✅ 대표님 정책: 조회는 내부직원 누구나 가능 (관리자/운영자/회사직원)
-    if not _is_internal(user):
+def _require_internal(db: Session, user: User) -> None:
+    """조회(검색/집계/엑셀)는 내부직원 모두 허용"""
+    if not _is_internal_db(db, user):
         raise HTTPException(status_code=403, detail="내부 직원만 접근 가능합니다.")
 
 
 def _is_admin_db(db: Session, user: User) -> bool:
-    role_id = getattr(user, "role_id", None)
-    if not role_id:
-        return False
-    code = db.execute(text("SELECT code FROM roles WHERE id = :id"), {"id": role_id}).scalar()
-    return code == "ADMIN"
+    code = _get_role_code(db, user)
+    return (code or "").upper() == "ADMIN"
 
 
 def _require_admin(db: Session, user: User) -> None:
@@ -68,76 +99,13 @@ def _require_admin(db: Session, user: User) -> None:
 
 
 # -------------------------
-# ✅ 조회/집계: 내부직원(6/7/8) 누구나 가능
-# -------------------------
-@router.get("/report", response_model=AttendanceReportResponse)
-def report(
-    period: Literal["day", "month", "year"] = Query(default="month"),
-    start_date: date = Query(...),
-    end_date: date = Query(...),
-    user_id: Optional[int] = Query(default=None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_internal(current_user)
-    items, settings = fetch_summary_report(db, start_date=start_date, end_date=end_date, user_id=user_id)
-    return AttendanceReportResponse(
-        period=period, start_date=start_date, end_date=end_date, settings=settings, items=items
-    )
-
-
-@router.get("/details", response_model=AttendanceDetailsResponse)
-def details(
-    start_date: date = Query(...),
-    end_date: date = Query(...),
-    user_id: int = Query(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_internal(current_user)
-    try:
-        return fetch_details(db, start_date=start_date, end_date=end_date, user_id=user_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
-@router.get("/day/sessions", response_model=DaySessionsResponse)
-def day_sessions(
-    user_id: int = Query(...),
-    work_date: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """특정 직원/특정 날짜(work_date_basis) 세션 원장 조회"""
-    _require_internal(current_user)
-    return get_day_sessions(db, user_id=user_id, work_date=work_date)
-
-
-@router.get("/excel")
-def excel(
-    period: Literal["day", "month", "year"] = Query(default="month"),
-    start_date: date = Query(...),
-    end_date: date = Query(...),
-    user_id: Optional[int] = Query(default=None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_internal(current_user)
-    content = build_excel(db, start_date=start_date, end_date=end_date, user_id=user_id)
-    filename = f"attendance_{period}_{start_date.isoformat()}_{end_date.isoformat()}.xlsx"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(
-        iter([content]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers,
-    )
-
-
-# -------------------------
-# ✅ 설정/정정/자동확정 실행: 관리자만 가능(기존 유지)
+# ✅ 설정/정정/자동확정 실행: 관리자만
 # -------------------------
 @router.get("/settings", response_model=AdminAttendanceSettings)
-def read_settings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def read_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     _require_admin(db, current_user)
     return get_settings(db)
 
@@ -185,24 +153,103 @@ def day_correct(
 
 
 @router.get("/auto-close/status")
-def auto_close_status(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def auto_close_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """자동퇴근 스케줄러 상태"""
     _require_admin(db, current_user)
     return get_status()
 
 
 @router.get("/auto-close/preview")
-def auto_close_preview(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def auto_close_preview(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """자동퇴근 확정 대상 미리보기(건수)"""
     _require_admin(db, current_user)
     return preview_auto_close(db)
 
 
 @router.post("/auto-close/run")
-def auto_close_run(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def auto_close_run(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """자동퇴근 확정 실행(end_at 업데이트)"""
     _require_admin(db, current_user)
     return run_auto_close(db)
+
+
+# -------------------------
+# ✅ 조회/검색/집계/엑셀: 내부직원(6/7/8) 모두 허용
+# -------------------------
+@router.get("/report", response_model=AttendanceReportResponse)
+def report(
+    period: Literal["day", "month", "year"] = Query(default="month"),
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    user_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_internal(db, current_user)
+    items, settings = fetch_summary_report(db, start_date=start_date, end_date=end_date, user_id=user_id)
+    return AttendanceReportResponse(
+        period=period,
+        start_date=start_date,
+        end_date=end_date,
+        settings=settings,
+        items=items,
+    )
+
+
+@router.get("/details", response_model=AttendanceDetailsResponse)
+def details(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    user_id: int = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_internal(db, current_user)
+    try:
+        return fetch_details(db, start_date=start_date, end_date=end_date, user_id=user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/day/sessions", response_model=DaySessionsResponse)
+def day_sessions(
+    user_id: int = Query(...),
+    work_date: date = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """특정 직원/특정 날짜(work_date_basis) 세션 원장 조회"""
+    _require_internal(db, current_user)
+    return get_day_sessions(db, user_id=user_id, work_date=work_date)
+
+
+@router.get("/excel")
+def excel(
+    period: Literal["day", "month", "year"] = Query(default="month"),
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    user_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_internal(db, current_user)
+    content = build_excel(db, start_date=start_date, end_date=end_date, user_id=user_id)
+    filename = f"attendance_{period}_{start_date.isoformat()}_{end_date.isoformat()}.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
 
 
 # ✅ 완전자동화: 라우터 로드 시 스케줄러 자동 시작
