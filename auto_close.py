@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .service import get_settings, _get_table_columns  # 기존 service 유틸/설정 재사용
+from app.modules.attendance.records_service import upsert_attendance_records_for_users
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -23,17 +24,17 @@ def preview_auto_close(db: Session) -> dict:
         SELECT
           SUM(CASE WHEN end_at IS NULL AND shift_type='DAY'
             AND now() >= make_timestamptz(
-              EXTRACT(YEAR FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(MONTH FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(DAY FROM (work_date_basis + interval '1 day'))::int,
+              EXTRACT(YEAR FROM work_date_basis)::int,
+              EXTRACT(MONTH FROM work_date_basis)::int,
+              EXTRACT(DAY FROM work_date_basis)::int,
               {day_cut_h}, {day_cut_m}, 0, 'Asia/Seoul')
             THEN 1 ELSE 0 END) AS day_cnt,
 
           SUM(CASE WHEN end_at IS NULL AND shift_type='NIGHT'
             AND now() >= make_timestamptz(
-              EXTRACT(YEAR FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(MONTH FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(DAY FROM (work_date_basis + interval '1 day'))::int,
+              EXTRACT(YEAR FROM work_date_basis)::int,
+              EXTRACT(MONTH FROM work_date_basis)::int,
+              EXTRACT(DAY FROM work_date_basis)::int,
               {night_cut_h}, {night_cut_m}, 0, 'Asia/Seoul')
             THEN 1 ELSE 0 END) AS night_cnt
         FROM work_sessions
@@ -74,14 +75,15 @@ def run_auto_close(db: Session) -> dict:
         WHERE end_at IS NULL
           AND shift_type = 'DAY'
           AND now() >= make_timestamptz(
-              EXTRACT(YEAR FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(MONTH FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(DAY FROM (work_date_basis + interval '1 day'))::int,
+              EXTRACT(YEAR FROM work_date_basis)::int,
+              EXTRACT(MONTH FROM work_date_basis)::int,
+              EXTRACT(DAY FROM work_date_basis)::int,
               {day_cut_h}, {day_cut_m}, 0, 'Asia/Seoul'
           )
-        RETURNING id
+        RETURNING user_id, work_date_basis
     """)
-    day_ids = [r[0] for r in db.execute(day_sql).all()]
+    day_rows = db.execute(day_sql).all()
+    day_pairs = [(r[0], r[1]) for r in day_rows]
 
     night_sql = text(f"""
         UPDATE work_sessions
@@ -94,14 +96,21 @@ def run_auto_close(db: Session) -> dict:
         WHERE end_at IS NULL
           AND shift_type = 'NIGHT'
           AND now() >= make_timestamptz(
-              EXTRACT(YEAR FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(MONTH FROM (work_date_basis + interval '1 day'))::int,
-              EXTRACT(DAY FROM (work_date_basis + interval '1 day'))::int,
+              EXTRACT(YEAR FROM work_date_basis)::int,
+              EXTRACT(MONTH FROM work_date_basis)::int,
+              EXTRACT(DAY FROM work_date_basis)::int,
               {night_cut_h}, {night_cut_m}, 0, 'Asia/Seoul'
           )
-        RETURNING id
+        RETURNING user_id, work_date_basis
     """)
-    night_ids = [r[0] for r in db.execute(night_sql).all()]
+    night_rows = db.execute(night_sql).all()
+    night_pairs = [(r[0], r[1]) for r in night_rows]
 
+    pairs = day_pairs + night_pairs
+    if pairs:
+        user_ids = sorted({u for (u, _) in pairs})
+        basis_dates = sorted({b for (_, b) in pairs})
+        # attendance_records를 work_sessions 변경사항으로 다시 확정(upsert)
+        upsert_attendance_records_for_users(db=db, user_ids=user_ids, basis_dates=basis_dates, actor_user_id=None)
     db.commit()
-    return {"day_updated": len(day_ids), "night_updated": len(night_ids)}
+    return {"day_updated": len(day_pairs), "night_updated": len(night_pairs)}

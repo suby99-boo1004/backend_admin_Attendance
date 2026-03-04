@@ -221,10 +221,9 @@ def start_scheduler():
         return
 
 
-    hour, minute = _calc_trigger_time_from_settings()
-
+    # 매시간 05분에 자동확정 실행
     _scheduler = BackgroundScheduler(timezone=_KST)
-    trigger = CronTrigger(hour=hour, minute=minute, second=0, timezone=_KST)
+    trigger = CronTrigger(minute=5, second=0, timezone=_KST)
     _scheduler.add_job(
         _job,
         trigger,
@@ -235,7 +234,7 @@ def start_scheduler():
         misfire_grace_time=300,
     )
     _scheduler.start()
-    log.info("admin attendance scheduler started (KST %02d:%02d)", hour, minute)
+    log.info("admin attendance scheduler started (KST every hour at :05)")
 
 
 def reload_schedule():
@@ -245,8 +244,8 @@ def reload_schedule():
         start_scheduler()
         return
 
-    hour, minute = _calc_trigger_time_from_settings()
-    trigger = CronTrigger(hour=hour, minute=minute, second=0, timezone=_KST)
+    # 매시간 05분에 자동확정 실행
+    trigger = CronTrigger(minute=5, second=0, timezone=_KST)
     _scheduler.add_job(
         _job,
         trigger,
@@ -256,7 +255,7 @@ def reload_schedule():
         coalesce=True,
         misfire_grace_time=300,
     )
-    log.info("admin attendance scheduler reloaded (KST %02d:%02d)", hour, minute)
+    log.info("admin attendance scheduler reloaded (KST every hour at :05)")
 
 
 def get_status():
