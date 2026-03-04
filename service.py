@@ -104,41 +104,23 @@ def _auto_checkout_end_at(
     # shift_type이 NIGHT면 우선
     if shift_type and str(shift_type).upper() in {s.upper() for s in settings.night_shift_types}:
         return _apply_tz_like(
-            start_at, datetime.combine(work_date + timedelta(days=1), settings.night_regular_checkout_time)
+            start_at, datetime.combine(work_date, settings.night_regular_checkout_time)
         )
 
     is_night = _assume_is_night(settings, start_at)
     if not is_night:
         return _apply_tz_like(start_at, datetime.combine(work_date, settings.day_regular_checkout_time))
 
-    return _apply_tz_like(start_at, datetime.combine(work_date + timedelta(days=1), settings.night_regular_checkout_time))
+    return _apply_tz_like(start_at, datetime.combine(work_date, settings.night_regular_checkout_time))
 
 
 def _fetch_users(db: Session) -> List[dict]:
     cols = _get_table_columns(db, "users")
-    # 내부직원(관리자/운영자/회사직원)만 집계 대상
-    # role_id: 6(관리자), 7(운영자), 8(회사직원)
-    role_filter_sql = ""
-    if "role_id" in cols:
-        role_filter_sql = " AND role_id IN (6, 7, 8) "
-
     if "is_active" in cols:
         return db.execute(
-            text(
-                "SELECT id as user_id, name as user_name "
-                "FROM users "
-                "WHERE is_active = true" + role_filter_sql + "ORDER BY id ASC"
-            )
+            text("SELECT id as user_id, name as user_name FROM users WHERE is_active = true ORDER BY id ASC")
         ).mappings().all()
-
-    return db.execute(
-        text(
-            "SELECT id as user_id, name as user_name "
-            "FROM users "
-            "WHERE 1=1" + role_filter_sql + "ORDER BY id ASC"
-        )
-    ).mappings().all()
-
+    return db.execute(text("SELECT id as user_id, name as user_name FROM users ORDER BY id ASC")).mappings().all()
 
 
 def _select_sessions_sql(settings: AdminAttendanceSettings, db: Session) -> str:
@@ -173,8 +155,8 @@ def fetch_summary_report(
         users = [u for u in users if int(u["user_id"]) == int(user_id)]
 
     sql = _select_sessions_sql(settings, db) + """
-        WHERE ws.start_at >= :start_dt
-          AND ws.start_at < :end_dt
+        WHERE COALESCE(ws.work_date_basis, ws.start_at::date) >= :start_date
+      AND COALESCE(ws.work_date_basis, ws.start_at::date) <= :end_date
           AND (:uid IS NULL OR ws.user_id = :uid)
         ORDER BY ws.user_id ASC, ws.start_at ASC
     """
@@ -182,8 +164,8 @@ def fetch_summary_report(
     sessions = db.execute(
         text(sql),
         {
-            "start_dt": datetime.combine(start_date, time(0, 0)),
-            "end_dt": datetime.combine(end_date + timedelta(days=1), time(0, 0)),
+            "start_date": start_date,
+            "end_date": end_date,
             "uid": user_id,
         },
     ).mappings().all()
@@ -335,8 +317,8 @@ def fetch_details(db: Session, start_date: date, end_date: date, user_id: int) -
         raise ValueError("user not found")
 
     sql = _select_sessions_sql(settings, db) + """
-        WHERE ws.start_at >= :start_dt
-          AND ws.start_at < :end_dt
+        WHERE COALESCE(ws.work_date_basis, ws.start_at::date) >= :start_date
+      AND COALESCE(ws.work_date_basis, ws.start_at::date) <= :end_date
           AND ws.user_id = :uid
         ORDER BY ws.start_at ASC
     """
@@ -344,8 +326,8 @@ def fetch_details(db: Session, start_date: date, end_date: date, user_id: int) -
     sessions = db.execute(
         text(sql),
         {
-            "start_dt": datetime.combine(start_date, time(0, 0)),
-            "end_dt": datetime.combine(end_date + timedelta(days=1), time(0, 0)),
+            "start_date": start_date,
+            "end_date": end_date,
             "uid": user_id,
         },
     ).mappings().all()
@@ -450,16 +432,16 @@ def build_excel(db: Session, start_date: date, end_date: date, user_id: Optional
     ws2.append(["직원","날짜","주야","휴일","근무시간","추가업무(Y)","근무형태(session_type)","외근 장소","업무/사유(task)"])
 
     sql = _select_sessions_sql(settings, db) + """
-        WHERE ws.start_at >= :start_dt
-          AND ws.start_at < :end_dt
+        WHERE COALESCE(ws.work_date_basis, ws.start_at::date) >= :start_date
+      AND COALESCE(ws.work_date_basis, ws.start_at::date) <= :end_date
           AND (:uid IS NULL OR ws.user_id = :uid)
         ORDER BY ws.user_id ASC, ws.start_at ASC
     """
     sessions = db.execute(
         text(sql),
         {
-            "start_dt": datetime.combine(start_date, time(0, 0)),
-            "end_dt": datetime.combine(end_date + timedelta(days=1), time(0, 0)),
+            "start_date": start_date,
+            "end_date": end_date,
             "uid": user_id,
         },
     ).mappings().all()
